@@ -1095,7 +1095,7 @@ void __weak kvm_arch_create_vm_debugfs(struct kvm *kvm)
 static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 {
 	struct kvm *kvm = kvm_arch_alloc_vm();   // 架构相关分配（x86: vmx/svm）
-	struct kvm_memslots *slots;
+	struct kvm_memslots *slots;              //memslot = guest 物理内存的一段“映射描述”
 	int r, i, j;
 
 	// 分配失败

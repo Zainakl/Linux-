@@ -439,41 +439,67 @@ EXPORT_SYMBOL_GPL(kvmppc_ld);
 
 int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 {
-	struct kvmppc_ops *kvm_ops = NULL;
+	struct kvmppc_ops *kvm_ops = NULL;  // 指向具体虚拟化实现（HV 或 PR）
 	int r;
 
 	/*
-	 * if we have both HV and PR enabled, default is HV
+	 * 如果同时支持 HV 和 PR，默认使用 HV
 	 */
-	if (type == 0) {
-		if (kvmppc_hv_ops)
+	if (type == 0) {  // 用户没有指定类型（默认情况）
+
+		if (kvmppc_hv_ops)         // 如果支持 HV 模式（硬件虚拟化）
 			kvm_ops = kvmppc_hv_ops;
 		else
-			kvm_ops = kvmppc_pr_ops;
-		if (!kvm_ops)
-			goto err_out;
-	} else	if (type == KVM_VM_PPC_HV) {
-		if (!kvmppc_hv_ops)
-			goto err_out;
-		kvm_ops = kvmppc_hv_ops;
-	} else if (type == KVM_VM_PPC_PR) {
-		if (!kvmppc_pr_ops)
-			goto err_out;
-		kvm_ops = kvmppc_pr_ops;
-	} else
-		goto err_out;
+			kvm_ops = kvmppc_pr_ops; // 否则退化为 PR（软件模拟）
 
+		if (!kvm_ops)              // 两种模式都不可用
+			goto err_out;
+
+	} else if (type == KVM_VM_PPC_HV) {  // 显式指定 HV 模式
+
+		if (!kvmppc_hv_ops)        // 不支持 HV
+			goto err_out;
+
+		kvm_ops = kvmppc_hv_ops;
+
+	} else if (type == KVM_VM_PPC_PR) {  // 显式指定 PR 模式
+
+		if (!kvmppc_pr_ops)        // 不支持 PR
+			goto err_out;
+
+		kvm_ops = kvmppc_pr_ops;
+
+	} else
+		goto err_out;              // 非法 type
+
+	/*
+	 * 增加模块引用计数，防止模块被卸载
+	 */
 	if (!try_module_get(kvm_ops->owner))
 		return -ENOENT;
 
+	/*
+	 * 把选中的虚拟化实现挂到 kvm->arch
+	 */
 	kvm->arch.kvm_ops = kvm_ops;
+
+	/*
+	 * 架构核心初始化（真正干活的地方）
+	 */
 	r = kvmppc_core_init_vm(kvm);
+
+	/*
+	 * 初始化失败则释放模块引用
+	 */
 	if (r)
 		module_put(kvm_ops->owner);
+
 	return r;
+
 err_out:
-	return -EINVAL;
+	return -EINVAL;  // 参数非法
 }
+
 
 void kvm_arch_destroy_vm(struct kvm *kvm)
 {

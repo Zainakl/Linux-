@@ -735,11 +735,16 @@ static inline bool kvm_arch_has_readonly_mem(struct kvm *kvm)
 }
 #endif
 
+
 struct kvm_memslots {
-	u64 generation;
-	atomic_long_t last_used_slot;
-	struct rb_root_cached hva_tree;
-	struct rb_root gfn_tree;
+	u64 generation;                  // memslots 的版本号，每次修改（增删改 slot）都会递增，用于 MMU/TLB 一致性判断
+
+	atomic_long_t last_used_slot;    // 最近访问的 memslot（缓存优化），避免频繁查找，提高性能（原子保证并发安全）
+
+	struct rb_root_cached hva_tree;  // HVA(host virtual addr) → memslot 的红黑树（带 cache），用于 host 地址查找（如 page fault）
+
+	struct rb_root gfn_tree;         // GFN(guest frame number) → memslot 的红黑树，用于 guest 地址查找（最核心路径）
+
 	/*
 	 * The mapping table from slot id to memslot.
 	 *
@@ -748,121 +753,160 @@ struct kvm_memslots {
 	 * Higher bucket counts bring only small performance improvements but
 	 * always result in higher memory usage (even for lower memslot counts).
 	 */
-	DECLARE_HASHTABLE(id_hash, 7);
-	int node_idx;
+	DECLARE_HASHTABLE(id_hash, 7);   // slot_id → memslot 的哈希表（2^7=128个桶），用于 ioctl/管理路径快速查找
+
+	int node_idx;                    // NUMA 节点索引，表示该 memslots 属于哪个 NUMA node（优化内存访问局部性）
 };
 
 struct kvm {
+
 #ifdef KVM_HAVE_MMU_RWLOCK
-	rwlock_t mmu_lock;
+	rwlock_t mmu_lock;          // MMU读写锁（保护页表/内存虚拟化相关）
 #else
-	spinlock_t mmu_lock;
+	spinlock_t mmu_lock;        // 不支持RW锁时用自旋锁
 #endif /* KVM_HAVE_MMU_RWLOCK */
 
-	struct mutex slots_lock;
+	struct mutex slots_lock;    // 保护 memslots（内存槽）的全局锁
 
 	/*
-	 * Protects the arch-specific fields of struct kvm_memory_slots in
-	 * use by the VM. To be used under the slots_lock (above) or in a
-	 * kvm->srcu critical section where acquiring the slots_lock would
-	 * lead to deadlock with the synchronize_srcu in
-	 * kvm_swap_active_memslots().
+	 * 保护 memslots 中架构相关字段
+	 * 注意：必须在 slots_lock 或 SRCU 保护下使用
 	 */
 	struct mutex slots_arch_lock;
-	struct mm_struct *mm; /* userspace tied to this vm */
-	unsigned long nr_memslot_pages;
-	/* The two memslot sets - active and inactive (per address space) */
+
+	struct mm_struct *mm;       // 绑定的用户进程地址空间（Guest内存来源）
+
+	unsigned long nr_memslot_pages; // 所有 memslot 总页数
+
+	/* ---------- 内存虚拟化核心 ---------- */
+
+	/* 双缓冲 memslots（每个 address space 两份：active / inactive） */
 	struct kvm_memslots __memslots[KVM_MAX_NR_ADDRESS_SPACES][2];
-	/* The current active memslot set for each address space */
+
+	/* 当前生效的 memslots（RCU保护） */
 	struct kvm_memslots __rcu *memslots[KVM_MAX_NR_ADDRESS_SPACES];
-	struct xarray vcpu_array;
+
+	/* ---------- vCPU 管理 ---------- */
+
+	struct xarray vcpu_array;   // 存储所有 vCPU（索引 = vcpu_id）
+
 	/*
-	 * Protected by slots_lock, but can be read outside if an
-	 * incorrect answer is acceptable.
+	 * 脏页日志 memslot 数量（用于 live migration）
+	 * 写需要 slots_lock，读可以无锁（允许不精确）
 	 */
 	atomic_t nr_memslots_dirty_logging;
 
-	/* Used to wait for completion of MMU notifiers.  */
-	spinlock_t mn_invalidate_lock;
-	unsigned long mn_active_invalidate_count;
-	struct rcuwait mn_memslots_update_rcuwait;
+	/* ---------- MMU notifier 同步 ---------- */
 
-	/* For management / invalidation of gfn_to_pfn_caches */
-	spinlock_t gpc_lock;
-	struct list_head gpc_list;
+	spinlock_t mn_invalidate_lock;      // MMU invalidate 锁
+	unsigned long mn_active_invalidate_count; // 当前 invalidate 计数
+	struct rcuwait mn_memslots_update_rcuwait; // 等待 memslots 更新完成
 
-	/*
-	 * created_vcpus is protected by kvm->lock, and is incremented
-	 * at the beginning of KVM_CREATE_VCPU.  online_vcpus is only
-	 * incremented after storing the kvm_vcpu pointer in vcpus,
-	 * and is accessed atomically.
-	 */
-	atomic_t online_vcpus;
-	int max_vcpus;
-	int created_vcpus;
-	int last_boosted_vcpu;
-	struct list_head vm_list;
-	struct mutex lock;
-	struct kvm_io_bus __rcu *buses[KVM_NR_BUSES];
+	/* ---------- gfn cache ---------- */
+
+	spinlock_t gpc_lock;         // gfn->pfn cache 锁
+	struct list_head gpc_list;   // cache 列表
+
+	/* ---------- vCPU 生命周期 ---------- */
+
+	atomic_t online_vcpus;       // 当前运行中的 vCPU 数
+	int max_vcpus;               // 最大 vCPU 数
+	int created_vcpus;           // 已创建 vCPU 数
+	int last_boosted_vcpu;       // 最近调度优化的 vCPU
+
+	/* ---------- VM 全局管理 ---------- */
+
+	struct list_head vm_list;    // 挂在全局 VM 链表上
+	struct mutex lock;           // VM 全局锁
+
+	/* ---------- IO 子系统 ---------- */
+
+	struct kvm_io_bus __rcu *buses[KVM_NR_BUSES]; // IO bus（PIO/MMIO）
+
 #ifdef CONFIG_HAVE_KVM_IRQCHIP
 	struct {
-		spinlock_t        lock;
-		struct list_head  items;
-		/* resampler_list update side is protected by resampler_lock. */
-		struct list_head  resampler_list;
-		struct mutex      resampler_lock;
+		spinlock_t lock;              // irqfd 锁
+		struct list_head items;       // irqfd 列表
+		struct list_head resampler_list; // 重采样器
+		struct mutex resampler_lock;  // resampler 锁
 	} irqfds;
 #endif
-	struct list_head ioeventfds;
-	struct kvm_vm_stat stat;
-	struct kvm_arch arch;
-	refcount_t users_count;
+
+	struct list_head ioeventfds;  // IO eventfd 列表（用户态通知）
+
+	struct kvm_vm_stat stat;      // VM 统计信息
+
+	struct kvm_arch arch;         // 架构相关数据（x86/vmx/svm/ppc等）
+
+	refcount_t users_count;       // 引用计数（VM 生命周期）
+
 #ifdef CONFIG_KVM_MMIO
-	struct kvm_coalesced_mmio_ring *coalesced_mmio_ring;
-	spinlock_t ring_lock;
-	struct list_head coalesced_zones;
+	struct kvm_coalesced_mmio_ring *coalesced_mmio_ring; // 合并 MMIO ring
+	spinlock_t ring_lock;         // ring 锁
+	struct list_head coalesced_zones; // 合并区域
 #endif
 
-	struct mutex irq_lock;
+	/* ---------- 中断 ---------- */
+
+	struct mutex irq_lock;        // 中断全局锁
+
 #ifdef CONFIG_HAVE_KVM_IRQCHIP
-	/*
-	 * Update side is protected by irq_lock.
-	 */
-	struct kvm_irq_routing_table __rcu *irq_routing;
+	struct kvm_irq_routing_table __rcu *irq_routing; // IRQ 路由表
 
-	struct hlist_head irq_ack_notifier_list;
+	struct hlist_head irq_ack_notifier_list; // 中断确认通知链表
 #endif
+
+	/* ---------- MMU notifier ---------- */
 
 #ifdef CONFIG_KVM_GENERIC_MMU_NOTIFIER
-	struct mmu_notifier mmu_notifier;
-	unsigned long mmu_invalidate_seq;
-	long mmu_invalidate_in_progress;
-	gfn_t mmu_invalidate_range_start;
-	gfn_t mmu_invalidate_range_end;
+	struct mmu_notifier mmu_notifier; // 内存变化监听器
+	unsigned long mmu_invalidate_seq; // invalidate 序号
+	long mmu_invalidate_in_progress;  // 是否正在 invalidate
+	gfn_t mmu_invalidate_range_start; // 失效起始
+	gfn_t mmu_invalidate_range_end;   // 失效结束
 #endif
-	struct list_head devices;
-	u64 manual_dirty_log_protect;
-	struct dentry *debugfs_dentry;
-	struct kvm_stat_data **debugfs_stat_data;
-	struct srcu_struct srcu;
-	struct srcu_struct irq_srcu;
-	pid_t userspace_pid;
+
+	/* ---------- 设备 ---------- */
+
+	struct list_head devices;     // 挂载的虚拟设备
+
+	u64 manual_dirty_log_protect; // 脏页保护控制
+
+	/* ---------- debug ---------- */
+
+	struct dentry *debugfs_dentry;   // debugfs 目录
+	struct kvm_stat_data **debugfs_stat_data; // debug 统计
+
+	/* ---------- RCU ---------- */
+
+	struct srcu_struct srcu;      // memslots 等使用
+	struct srcu_struct irq_srcu;  // 中断路径使用
+
+	/* ---------- 其他 ---------- */
+
+	pid_t userspace_pid;          // 创建 VM 的用户进程 PID
+
 	bool override_halt_poll_ns;
 	unsigned int max_halt_poll_ns;
-	u32 dirty_ring_size;
-	bool dirty_ring_with_bitmap;
-	bool vm_bugged;
-	bool vm_dead;
+
+	u32 dirty_ring_size;          // dirty ring 大小
+	bool dirty_ring_with_bitmap;  // 是否带 bitmap
+
+	bool vm_bugged;               // VM 是否异常
+	bool vm_dead;                 // VM 是否已销毁
 
 #ifdef CONFIG_HAVE_KVM_PM_NOTIFIER
-	struct notifier_block pm_notifier;
+	struct notifier_block pm_notifier; // 电源管理通知
 #endif
+
 #ifdef CONFIG_KVM_GENERIC_MEMORY_ATTRIBUTES
-	/* Protected by slots_locks (for writes) and RCU (for reads) */
+	/* mem 属性（RCU读 + slots_lock写） */
 	struct xarray mem_attr_array;
 #endif
-	char stats_id[KVM_STATS_NAME_SIZE];
+
+	char stats_id[KVM_STATS_NAME_SIZE]; // VM 标识（统计用）
 };
+
 
 #define kvm_err(fmt, ...) \
 	pr_err("kvm [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
