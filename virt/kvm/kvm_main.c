@@ -1088,26 +1088,41 @@ void __weak kvm_arch_create_vm_debugfs(struct kvm *kvm)
 {
 }
 
+
+/*
+ * 创建一个 KVM 虚拟机实例（核心入口）
+ */
 static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 {
-	struct kvm *kvm = kvm_arch_alloc_vm();
+	struct kvm *kvm = kvm_arch_alloc_vm();   // 架构相关分配（x86: vmx/svm）
 	struct kvm_memslots *slots;
 	int r, i, j;
 
+	// 分配失败
 	if (!kvm)
 		return ERR_PTR(-ENOMEM);
 
-	KVM_MMU_LOCK_INIT(kvm);
-	mmgrab(current->mm);
-	kvm->mm = current->mm;
-	kvm_eventfd_init(kvm);
-	mutex_init(&kvm->lock);
-	mutex_init(&kvm->irq_lock);
-	mutex_init(&kvm->slots_lock);
-	mutex_init(&kvm->slots_arch_lock);
+	/* ---------- 1. 基础初始化 ---------- */
+
+	KVM_MMU_LOCK_INIT(kvm);   // 初始化 MMU 锁（内存虚拟化核心）
+
+	mmgrab(current->mm);      // 增加当前进程 mm 引用计数
+	kvm->mm = current->mm;   // 绑定用户态地址空间（非常关键）
+
+	kvm_eventfd_init(kvm);   // 初始化 eventfd（用户态通知机制）
+
+	// 初始化各种锁
+	mutex_init(&kvm->lock);           // VM 全局锁
+	mutex_init(&kvm->irq_lock);       // 中断相关锁
+	mutex_init(&kvm->slots_lock);     // 内存槽锁
+	mutex_init(&kvm->slots_arch_lock);// 架构相关内存锁
+
 	spin_lock_init(&kvm->mn_invalidate_lock);
+
 	rcuwait_init(&kvm->mn_memslots_update_rcuwait);
-	xa_init(&kvm->vcpu_array);
+
+	xa_init(&kvm->vcpu_array);  // vCPU 存储结构（xarray）
+
 #ifdef CONFIG_KVM_GENERIC_MEMORY_ATTRIBUTES
 	xa_init(&kvm->mem_attr_array);
 #endif
@@ -1115,62 +1130,102 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 	INIT_LIST_HEAD(&kvm->gpc_list);
 	spin_lock_init(&kvm->gpc_lock);
 
-	INIT_LIST_HEAD(&kvm->devices);
-	kvm->max_vcpus = KVM_MAX_VCPUS;
+	INIT_LIST_HEAD(&kvm->devices);   // 设备链表
+
+	kvm->max_vcpus = KVM_MAX_VCPUS;  // 最大 vCPU 数
 
 	BUILD_BUG_ON(KVM_MEM_SLOTS_NUM > SHRT_MAX);
 
 	/*
-	 * Force subsequent debugfs file creations to fail if the VM directory
-	 * is not created (by kvm_create_vm_debugfs()).
+	 * debugfs 未初始化前默认失败
 	 */
 	kvm->debugfs_dentry = ERR_PTR(-ENOENT);
 
-	snprintf(kvm->stats_id, sizeof(kvm->stats_id), "kvm-%d",
-		 task_pid_nr(current));
+	snprintf(kvm->stats_id, sizeof(kvm->stats_id),
+		 "kvm-%d", task_pid_nr(current));
+
+	/* ---------- 2. SRCU 初始化（核心同步机制） ---------- */
 
 	r = -ENOMEM;
-	if (init_srcu_struct(&kvm->srcu))
+
+	if (init_srcu_struct(&kvm->srcu))        // memslots 等使用
 		goto out_err_no_srcu;
-	if (init_srcu_struct(&kvm->irq_srcu))
+
+	if (init_srcu_struct(&kvm->irq_srcu))    // 中断路径使用
 		goto out_err_no_irq_srcu;
 
-	r = kvm_init_irq_routing(kvm);
+	/* ---------- 3. 中断路由 ---------- */
+
+	r = kvm_init_irq_routing(kvm);  // 建立 IRQ routing table
 	if (r)
 		goto out_err_no_irq_routing;
 
-	refcount_set(&kvm->users_count, 1);
+	refcount_set(&kvm->users_count, 1);  // VM 引用计数
+
+	/* ---------- 4. 初始化 memslots（极其重要） ---------- */
 
 	for (i = 0; i < kvm_arch_nr_memslot_as_ids(kvm); i++) {
 		for (j = 0; j < 2; j++) {
+
 			slots = &kvm->__memslots[i][j];
 
-			atomic_long_set(&slots->last_used_slot, (unsigned long)NULL);
+			atomic_long_set(&slots->last_used_slot,
+					(unsigned long)NULL);
+
+			// HVA（host virtual address）树
 			slots->hva_tree = RB_ROOT_CACHED;
+
+			// GFN（guest frame number）树
 			slots->gfn_tree = RB_ROOT;
-			hash_init(slots->id_hash);
+
+			hash_init(slots->id_hash);  // slot id → slot
+
 			slots->node_idx = j;
 
-			/* Generations must be different for each address space. */
+			/*
+			 * generation 用于 RCU 版本控制
+			 * 每个 address space 必须不同
+			 */
 			slots->generation = i;
 		}
 
-		rcu_assign_pointer(kvm->memslots[i], &kvm->__memslots[i][0]);
+		/*
+		 * 当前使用的 memslots（RCU 指针）
+		 */
+		rcu_assign_pointer(kvm->memslots[i],
+				   &kvm->__memslots[i][0]);
 	}
 
+	/* ---------- 5. 初始化 IO bus ---------- */
+
 	r = -ENOMEM;
+
 	for (i = 0; i < KVM_NR_BUSES; i++) {
-		rcu_assign_pointer(kvm->buses[i],
-			kzalloc(sizeof(struct kvm_io_bus), GFP_KERNEL_ACCOUNT));
+		rcu_assign_pointer(
+			kvm->buses[i],
+			kzalloc(sizeof(struct kvm_io_bus),
+				GFP_KERNEL_ACCOUNT)
+		);
+
 		if (!kvm->buses[i])
 			goto out_err_no_arch_destroy_vm;
 	}
+
+	/* ---------- 6. 架构相关初始化（核心） ---------- */
 
 	r = kvm_arch_init_vm(kvm, type);
 	if (r)
 		goto out_err_no_arch_destroy_vm;
 
-	r = kvm_enable_virtualization();
+	/*
+	 * x86 下这里会：
+	 * - 初始化 VMX / SVM
+	 * - 创建 VMCS / VMCB
+	 */
+
+	/* ---------- 7. 启用硬件虚拟化 ---------- */
+
+	r = kvm_enable_virtualization();  // 开启 VT-x / SVM
 	if (r)
 		goto out_err_no_disable;
 
@@ -1178,52 +1233,82 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 	INIT_HLIST_HEAD(&kvm->irq_ack_notifier_list);
 #endif
 
+	/* ---------- 8. MMU notifier（非常关键） ---------- */
+
 	r = kvm_init_mmu_notifier(kvm);
 	if (r)
 		goto out_err_no_mmu_notifier;
+
+	/*
+	 * 监听用户态内存变化（mmap/munmap）
+	 * 用于同步 shadow page table / EPT
+	 */
+
+	/* ---------- 9. MMIO 优化 ---------- */
 
 	r = kvm_coalesced_mmio_init(kvm);
 	if (r < 0)
 		goto out_no_coalesced_mmio;
 
+	/* ---------- 10. debugfs ---------- */
+
 	r = kvm_create_vm_debugfs(kvm, fdname);
 	if (r)
 		goto out_err_no_debugfs;
+
+	/* ---------- 11. 加入全局 VM 列表 ---------- */
 
 	mutex_lock(&kvm_lock);
 	list_add(&kvm->vm_list, &vm_list);
 	mutex_unlock(&kvm_lock);
 
-	preempt_notifier_inc();
-	kvm_init_pm_notifier(kvm);
+	/* ---------- 12. 调度 & 电源管理 ---------- */
+
+	preempt_notifier_inc();    // 调度通知
+	kvm_init_pm_notifier(kvm); // 电源管理
 
 	return kvm;
 
+	/* ================= 错误处理路径 ================= */
+
 out_err_no_debugfs:
 	kvm_coalesced_mmio_free(kvm);
+
 out_no_coalesced_mmio:
 #ifdef CONFIG_KVM_GENERIC_MMU_NOTIFIER
 	if (kvm->mmu_notifier.ops)
-		mmu_notifier_unregister(&kvm->mmu_notifier, current->mm);
+		mmu_notifier_unregister(&kvm->mmu_notifier,
+					current->mm);
 #endif
+
 out_err_no_mmu_notifier:
-	kvm_disable_virtualization();
+	kvm_disable_virtualization();   // 关闭虚拟化
+
 out_err_no_disable:
-	kvm_arch_destroy_vm(kvm);
+	kvm_arch_destroy_vm(kvm);       // 架构清理
+
 out_err_no_arch_destroy_vm:
 	WARN_ON_ONCE(!refcount_dec_and_test(&kvm->users_count));
+
 	for (i = 0; i < KVM_NR_BUSES; i++)
-		kfree(kvm_get_bus(kvm, i));
-	kvm_free_irq_routing(kvm);
+		kfree(kvm_get_bus(kvm, i));  // 释放 IO bus
+
+	kvm_free_irq_routing(kvm);      // 释放 IRQ routing
+
 out_err_no_irq_routing:
 	cleanup_srcu_struct(&kvm->irq_srcu);
+
 out_err_no_irq_srcu:
 	cleanup_srcu_struct(&kvm->srcu);
+
 out_err_no_srcu:
-	kvm_arch_free_vm(kvm);
-	mmdrop(current->mm);
+	kvm_arch_free_vm(kvm);          // 释放 VM
+
+	mmdrop(current->mm);            // 释放 mm
+
 	return ERR_PTR(r);
 }
+
 
 static void kvm_destroy_devices(struct kvm *kvm)
 {
