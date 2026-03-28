@@ -3073,26 +3073,35 @@ struct page *rmqueue(struct zone *preferred_zone,
 {
 	struct page *page;
 
+    // 如果允许使用 per-cpu page cache 且分配阶数适合
 	if (likely(pcp_allowed_order(order))) {
+        // 从 per-cpu page list 分配页（快速路径）
 		page = rmqueue_pcplist(preferred_zone, zone, order,
 				       migratetype, alloc_flags);
+        // 如果分配成功，直接跳到 out 返回
 		if (likely(page))
 			goto out;
 	}
 
+    // 如果 per-cpu 分配失败或不允许，调用伙伴系统分配（rmqueue_buddy）
 	page = rmqueue_buddy(preferred_zone, zone, order, alloc_flags,
 							migratetype);
 
 out:
 	/* Separate test+clear to avoid unnecessary atomics */
+    // 如果是 kswapd 触发的分配，并且 zone 有 ZONE_BOOSTED_WATERMARK
 	if ((alloc_flags & ALLOC_KSWAPD) &&
 	    unlikely(test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags))) {
+        // 清除 boosted 标志
 		clear_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
+        // 唤醒 kswapd，进行内存回收
 		wakeup_kswapd(zone, 0, 0, zone_idx(zone));
 	}
 
+    // 内核自检：确保返回的 page 不在非法范围
 	VM_BUG_ON_PAGE(page && bad_range(zone, page), page);
-	return page;
+
+	return page;  // 返回分配到的 page 或 NULL
 }
 
 static inline long __zone_watermark_unusable_free(struct zone *z,
@@ -3213,28 +3222,36 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 {
 	long free_pages;
 
+    // 获取当前 zone 的空闲页数
 	free_pages = zone_page_state(z, NR_FREE_PAGES);
 
 	/*
 	 * Fast check for order-0 only. If this fails then the reserves
 	 * need to be calculated.
 	 */
-	if (!order) {
+	if (!order) {  // order=0 时做快速检查（单页分配）
 		long usable_free;
 		long reserved;
 
+        // usable_free = 当前空闲页
 		usable_free = free_pages;
+
+        // 计算不可用页数（保留页、原子页、低内存保留等）
 		reserved = __zone_watermark_unusable_free(z, 0, alloc_flags);
 
 		/* reserved may over estimate high-atomic reserves. */
+        // usable_free 减去保留页，得到可用空闲页
 		usable_free -= min(usable_free, reserved);
+
+        // 可用页大于要求的 mark + lowmem_reserve 时返回 true
 		if (usable_free > mark + z->lowmem_reserve[highest_zoneidx])
-			return true;
+			return true;  // 快速路径满足 watermark
 	}
 
+    // order != 0 或快速检查未通过时，调用完整检查
 	if (__zone_watermark_ok(z, order, mark, highest_zoneidx, alloc_flags,
 					free_pages))
-		return true;
+		return true;  // 水位检查通过
 
 	/*
 	 * Ignore watermark boosting for __GFP_HIGH order-0 allocations
@@ -3244,12 +3261,15 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 	 */
 	if (unlikely(!order && (alloc_flags & ALLOC_MIN_RESERVE) && z->watermark_boost
 		&& ((alloc_flags & ALLOC_WMARK_MASK) == WMARK_MIN))) {
+        // 对 order-0 的 min-reserve 分配，忽略 watermark boost
 		mark = z->_watermark[WMARK_MIN];
+
+        // 再次调用完整检查
 		return __zone_watermark_ok(z, order, mark, highest_zoneidx,
 					alloc_flags, free_pages);
 	}
 
-	return false;
+	return false;  // watermark 检查不通过，zone 空闲页不足
 }
 
 bool zone_watermark_ok_safe(struct zone *z, unsigned int order,
@@ -3338,46 +3358,35 @@ static struct page *
 get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 						const struct alloc_context *ac)
 {
-	struct zoneref *z;
-	struct zone *zone;
-	struct pglist_data *last_pgdat = NULL;
-	bool last_pgdat_dirty_ok = false;
-	bool no_fallback;
+	struct zoneref *z;                // 当前正在尝试的 zoneref（指向某个 zone）
+	struct zone *zone;                // 当前分配的 zone
+	struct pglist_data *last_pgdat = NULL;       // 上一次访问的 pgdat
+	bool last_pgdat_dirty_ok = false;           // 上次 pgdat 是否可接受更多脏页
+	bool no_fallback;                 // 是否禁用备选 zone（避免碎片化）
 
-retry:
+retry:	
 	/*
 	 * Scan zonelist, looking for a zone with enough free.
 	 * See also cpuset_node_allowed() comment in kernel/cgroup/cpuset.c.
 	 */
-	no_fallback = alloc_flags & ALLOC_NOFRAGMENT;
-	z = ac->preferred_zoneref;
+	no_fallback = alloc_flags & ALLOC_NOFRAGMENT;   // 判断是否开启避免碎片化标志
+	z = ac->preferred_zoneref;                      // 从首选 zoneref 开始扫描
+
+	// 遍历 zonelist 中的 zone（首选 zone → 高 zoneidx → 节点掩码限制）
 	for_next_zone_zonelist_nodemask(zone, z, ac->highest_zoneidx,
 					ac->nodemask) {
 		struct page *page;
 		unsigned long mark;
 
+		// 检查 cpuset 限制，如果 zone 不允许则跳过
 		if (cpusets_enabled() &&
 			(alloc_flags & ALLOC_CPUSET) &&
 			!__cpuset_zone_allowed(zone, gfp_mask))
 				continue;
+
 		/*
-		 * When allocating a page cache page for writing, we
-		 * want to get it from a node that is within its dirty
-		 * limit, such that no single node holds more than its
-		 * proportional share of globally allowed dirty pages.
-		 * The dirty limits take into account the node's
-		 * lowmem reserves and high watermark so that kswapd
-		 * should be able to balance it without having to
-		 * write pages from its LRU list.
-		 *
-		 * XXX: For now, allow allocations to potentially
-		 * exceed the per-node dirty limit in the slowpath
-		 * (spread_dirty_pages unset) before going into reclaim,
-		 * which is important when on a NUMA setup the allowed
-		 * nodes are together not big enough to reach the
-		 * global limit.  The proper fix for these situations
-		 * will require awareness of nodes in the
-		 * dirty-throttling and the flusher threads.
+		 * 如果需要 spread_dirty_pages（写页缓存），
+		 * 检查该节点的脏页是否允许更多分配
 		 */
 		if (ac->spread_dirty_pages) {
 			if (last_pgdat != zone->zone_pgdat) {
@@ -3386,46 +3395,41 @@ retry:
 			}
 
 			if (!last_pgdat_dirty_ok)
-				continue;
+				continue;  // 脏页超限，跳过该 zone
 		}
 
+		// 避免跨节点分配时仍禁止碎片化时的处理
 		if (no_fallback && nr_online_nodes > 1 &&
 		    zone != zonelist_zone(ac->preferred_zoneref)) {
 			int local_nid;
 
-			/*
-			 * If moving to a remote node, retry but allow
-			 * fragmenting fallbacks. Locality is more important
-			 * than fragmentation avoidance.
-			 */
+			// 如果是远端节点，允许碎片化以保证 locality
 			local_nid = zonelist_node_idx(ac->preferred_zoneref);
 			if (zone_to_nid(zone) != local_nid) {
 				alloc_flags &= ~ALLOC_NOFRAGMENT;
-				goto retry;
+				goto retry;  // 重试
 			}
 		}
 
-		cond_accept_memory(zone, order);
+		cond_accept_memory(zone, order);  // 条件接受 zone 内存，用于内存统计
 
 		/*
-		 * Detect whether the number of free pages is below high
-		 * watermark.  If so, we will decrease pcp->high and free
-		 * PCP pages in free path to reduce the possibility of
-		 * premature page reclaiming.  Detection is done here to
-		 * avoid to do that in hotter free path.
+		 * 检查 zone 空闲页是否低于 high watermark
+		 * 如果低，调整 PCP（per-cpu page）缓存
 		 */
 		if (test_bit(ZONE_BELOW_HIGH, &zone->flags))
 			goto check_alloc_wmark;
 
-		mark = high_wmark_pages(zone);
+		mark = high_wmark_pages(zone);   // high watermark 页数
 		if (zone_watermark_fast(zone, order, mark,
 					ac->highest_zoneidx, alloc_flags,
 					gfp_mask))
-			goto try_this_zone;
+			goto try_this_zone;          // 高水位允许分配，尝试该 zone
 		else
-			set_bit(ZONE_BELOW_HIGH, &zone->flags);
+			set_bit(ZONE_BELOW_HIGH, &zone->flags); // 标记低水位
 
 check_alloc_wmark:
+		// 使用普通 watermark 检查是否满足分配条件
 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
 		if (!zone_watermark_fast(zone, order, mark,
 				       ac->highest_zoneidx, alloc_flags,
@@ -3435,33 +3439,29 @@ check_alloc_wmark:
 			if (cond_accept_memory(zone, order))
 				goto try_this_zone;
 
-			/*
-			 * Watermark failed for this zone, but see if we can
-			 * grow this zone if it contains deferred pages.
-			 */
+			// 尝试增长 zone（deferred pages）
 			if (deferred_pages_enabled()) {
 				if (_deferred_grow_zone(zone, order))
 					goto try_this_zone;
 			}
-			/* Checked here to keep the fast path fast */
-			BUILD_BUG_ON(ALLOC_NO_WATERMARKS < NR_WMARK);
+
+			// ALLOC_NO_WATERMARKS 忽略 watermark，直接尝试分配
 			if (alloc_flags & ALLOC_NO_WATERMARKS)
 				goto try_this_zone;
 
+			// 尝试回收节点内存
 			if (!node_reclaim_enabled() ||
 			    !zone_allows_reclaim(zonelist_zone(ac->preferred_zoneref), zone))
 				continue;
 
 			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);
 			switch (ret) {
-			case NODE_RECLAIM_NOSCAN:
-				/* did not scan */
+			case NODE_RECLAIM_NOSCAN:  // 没有扫描，跳过
 				continue;
-			case NODE_RECLAIM_FULL:
-				/* scanned but unreclaimable */
+			case NODE_RECLAIM_FULL:    // 扫描但不可回收，跳过
 				continue;
 			default:
-				/* did we reclaim enough */
+				// 回收后检查是否满足 watermark
 				if (zone_watermark_ok(zone, order, mark,
 					ac->highest_zoneidx, alloc_flags))
 					goto try_this_zone;
@@ -3471,24 +3471,26 @@ check_alloc_wmark:
 		}
 
 try_this_zone:
+		// 尝试从该 zone 队列中分配页面
 		page = rmqueue(zonelist_zone(ac->preferred_zoneref), zone, order,
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {
+			// 初始化新分配的页
 			prep_new_page(page, order, gfp_mask, alloc_flags);
 
 			/*
-			 * If this is a high-order atomic allocation then check
-			 * if the pageblock should be reserved for the future
+			 * 如果是高阶原子分配，可能需要预留整个 pageblock
 			 */
 			if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
 				reserve_highatomic_pageblock(page, order, zone);
 
-			return page;
+			return page;  // 返回成功分配的页
 		} else {
+			// 条件接受 zone 内存时，再尝试
 			if (cond_accept_memory(zone, order))
 				goto try_this_zone;
 
-			/* Try again if zone has deferred pages */
+			// deferred grow 再尝试
 			if (deferred_pages_enabled()) {
 				if (_deferred_grow_zone(zone, order))
 					goto try_this_zone;
@@ -3497,15 +3499,14 @@ try_this_zone:
 	}
 
 	/*
-	 * It's possible on a UMA machine to get through all zones that are
-	 * fragmented. If avoiding fragmentation, reset and try again.
+	 * 如果所有 zone 都无法分配，且禁止碎片化时，重置标志并重试
 	 */
 	if (no_fallback) {
 		alloc_flags &= ~ALLOC_NOFRAGMENT;
 		goto retry;
 	}
 
-	return NULL;
+	return NULL;  // 所有尝试失败，返回 NULL
 }
 
 static void warn_alloc_show_mem(gfp_t gfp_mask, nodemask_t *nodemask)
@@ -4493,41 +4494,63 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 		struct alloc_context *ac, gfp_t *alloc_gfp,
 		unsigned int *alloc_flags)
 {
+    // 根据 gfp_mask 计算允许分配的最高 zone，并保存到 alloc_context
 	ac->highest_zoneidx = gfp_zone(gfp_mask);
+
+    // 获取首选节点 preferred_nid 对应的 zonelist（快速路径分配使用）
 	ac->zonelist = node_zonelist(preferred_nid, gfp_mask);
+
+    // 将传入的节点掩码保存到 alloc_context
 	ac->nodemask = nodemask;
+
+    // 根据 gfp_mask 计算迁移类型（可移动/不可移动/可回收），保存到 alloc_context
 	ac->migratetype = gfp_migratetype(gfp_mask);
 
+    // 如果 cpusets 功能启用
 	if (cpusets_enabled()) {
+        // 在 alloc_gfp 中加入 __GFP_HARDWALL，表示强制 CPU 节点绑定
 		*alloc_gfp |= __GFP_HARDWALL;
+
 		/*
-		 * When we are in the interrupt context, it is irrelevant
-		 * to the current task context. It means that any node ok.
+		 * 当处于任务上下文（非中断）且未指定 nodemask 时，
+		 * 使用当前 cpuset 允许的节点
 		 */
 		if (in_task() && !ac->nodemask)
 			ac->nodemask = &cpuset_current_mems_allowed;
 		else
+            // 否则设置 ALLOC_CPUSET 标志，表示考虑 cpuset
 			*alloc_flags |= ALLOC_CPUSET;
 	}
 
-	might_alloc(gfp_mask);
+    // 获取文件系统回收锁，用于可能触发 fs reclaim 的场景
+	fs_reclaim_acquire(gfp_mask);
 
+    // 释放 fs reclaim 锁
+	fs_reclaim_release(gfp_mask);
+
+    // 如果 gfp_mask 允许直接回收内存，则标记可能睡眠
+	might_sleep_if(gfp_mask & __GFP_DIRECT_RECLAIM);
+
+    // 用于 fault injection 测试分配失败的情况
 	if (should_fail_alloc_page(gfp_mask, order))
 		return false;
 
+    // 根据 gfp_mask 和已有 alloc_flags 计算 CMA（连续内存分配）相关的标志
 	*alloc_flags = gfp_to_alloc_flags_cma(gfp_mask, *alloc_flags);
 
-	/* Dirty zone balancing only done in the fast path */
+    // 设置是否在快速路径分配中进行脏页扩散，仅在快速路径使用
 	ac->spread_dirty_pages = (gfp_mask & __GFP_WRITE);
 
 	/*
-	 * The preferred zone is used for statistics but crucially it is
-	 * also used as the starting point for the zonelist iterator. It
-	 * may get reset for allocations that ignore memory policies.
+	 * 获取首选 zone 引用，用于：
+	 * 1. 统计使用
+	 * 2. 快速路径分配时从 zonelist 起始位置开始迭代
+	 * 可能会在忽略内存策略的分配中被重置
 	 */
 	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
 					ac->highest_zoneidx, ac->nodemask);
 
+    // 准备完成，返回 true 表示 alloc_context 已初始化可用
 	return true;
 }
 
