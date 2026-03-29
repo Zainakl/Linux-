@@ -3034,7 +3034,7 @@ static struct page *rmqueue_pcplist(struct zone *preferred_zone,
 	if (!pcp) {
 		pcp_trylock_finish(UP_flags);
 		return NULL;
-	}
+	}	
 
 	/*
 	 * On allocation, reduce the number of pages that are batch freed.
@@ -4852,21 +4852,35 @@ EXPORT_SYMBOL(get_zeroed_page_noprof);
  * Context: May be called in interrupt context or while holding a normal
  * spinlock, but not in NMI context or while holding a raw spinlock.
  */
-void __free_pages(struct page *page, unsigned int order)
+static struct page *
+__free_pages(struct page *page, unsigned int order)
 {
-	/* get PageHead before we drop reference */
-	int head = PageHead(page);
-	struct alloc_tag *tag = pgalloc_tag_get(page);
+    /* 判断该页是否是高阶页的 head page（首页） */
+    int head = PageHead(page);
 
-	if (put_page_testzero(page))
-		free_frozen_pages(page, order);
-	else if (!head) {
-		pgalloc_tag_sub_pages(tag, (1 << order) - 1);
-		while (order-- > 0)
-			free_frozen_pages(page + (1 << order), order);
-	}
+    /* 获取分配标签，用于高阶页管理、调试和统计 */
+    struct alloc_tag *tag = pgalloc_tag_get(page);
+
+    /* 
+     * 减少 page 的引用计数，如果引用计数变为 0，则可以释放
+     * put_page_testzero 返回 true 表示引用计数已经为零
+     */
+    if (put_page_testzero(page))
+        free_frozen_pages(page, order); // 真正释放页到 PCP 或伙伴系统
+    else if (!head) {
+        /*
+         * 如果 page 不是 head，说明它是高阶页的一部分
+         * 高阶页包含 head + 后续页，需要循环释放所有子页
+         */
+        pgalloc_tag_sub_pages(tag, (1 << order) - 1); // 更新 alloc_tag，减去释放的子页数量
+
+        /* 循环释放高阶页的每个子页 */
+        while (order-- > 0)
+            free_frozen_pages(page + (1 << order), order);
+            /* page + (1 << order) 计算子页的 page 结构体偏移 */
+    }
 }
-EXPORT_SYMBOL(__free_pages);
+EXPORT_SYMBOL(__free_pages); // 导出符号，允许模块调用
 
 void free_pages(unsigned long addr, unsigned int order)
 {

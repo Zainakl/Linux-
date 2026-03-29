@@ -3768,15 +3768,25 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
 			pgprot_t prot, unsigned long vm_flags, int node,
 			const void *caller)
 {
-	struct vm_struct *area;
-	void *ret;
+	struct vm_struct *area;   // 描述 vmalloc 区域的元数据结构
+	void *ret;                // 接收底层映射函数返回值
 	kasan_vmalloc_flags_t kasan_flags = KASAN_VMALLOC_NONE;
+	// KASAN 相关标志，用于决定 vmalloc 区域是否要做 poison/unpoison、是否初始化等
+
 	unsigned long real_size = size;
+	// 保存用户原始请求大小，后面 size 可能会因为 huge vmap 对齐被修改
+
 	unsigned long real_align = align;
+	// 保存用户原始对齐要求，后面 align 也可能被调整
+
 	unsigned int shift = PAGE_SHIFT;
+	// 默认按普通页（4KB）映射
+	// 如果允许 huge vmap，后面可能提升成 PMD_SHIFT 等更大粒度映射
 
 	if (WARN_ON_ONCE(!size))
 		return NULL;
+	// 如果申请大小为 0，直接报警并返回 NULL
+	// vmalloc 不允许分配 0 字节
 
 	if ((size >> PAGE_SHIFT) > totalram_pages()) {
 		warn_alloc(gfp_mask, NULL,
@@ -3784,6 +3794,8 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
 			real_size);
 		return NULL;
 	}
+	// 这里先做一个粗粒度合法性检查：
+	// 如果申请页数已经超过系统总物理页数，明显不可能成功，直接失败
 
 	if (vmap_allow_huge && (vm_flags & VM_ALLOW_HUGE_VMAP)) {
 		/*
@@ -3792,30 +3804,55 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
 		 * their allocations due to apply_to_page_range not
 		 * supporting them.
 		 */
+		// 如果系统允许 huge vmap，并且当前分配也允许 huge 映射，
+		// 那么尝试使用更大的页表粒度映射，以减少页表项数量、提高性能
 
 		if (arch_vmap_pmd_supported(prot) && size >= PMD_SIZE)
 			shift = PMD_SHIFT;
+		// 如果架构支持 PMD 级别的大页映射，并且申请大小至少有一个 PMD_SIZE，
+		// 则优先尝试 PMD 粒度映射（比如 2MB）
+
 		else
 			shift = arch_vmap_pte_supported_shift(size);
+		// 否则让架构自己决定支持的更大粒度，实在不行还是 PAGE_SHIFT
 
 		align = max(real_align, 1UL << shift);
+		// 如果要用更大粒度映射，则地址对齐也必须提升到该粒度
+
 		size = ALIGN(real_size, 1UL << shift);
+		// 同时把映射大小向该粒度对齐
 	}
 
 again:
 	area = __get_vm_area_node(real_size, align, shift, VM_ALLOC |
 				  VM_UNINITIALIZED | vm_flags, start, end, node,
 				  gfp_mask, caller);
+	// 在 vmalloc 虚拟地址空间里申请一段连续虚拟区间，并分配 vm_struct
+	//
+	// 注意：
+	// 1. 这里只是“占虚拟地址空间”，还没有分配物理页
+	// 2. VM_ALLOC 表示这是 vmalloc 类区域
+	// 3. VM_UNINITIALIZED 表示这个 vm_struct 目前还没完全初始化好
+	// 4. real_size 是用户真实请求大小，align/shift 影响地址布局与映射粒度
+
 	if (!area) {
 		bool nofail = gfp_mask & __GFP_NOFAIL;
+		// 如果申请失败，看是否指定了 __GFP_NOFAIL
+		// 这个标志意味着：不能轻易失败，要持续重试
+
 		warn_alloc(gfp_mask, NULL,
 			"vmalloc error: size %lu, vm_struct allocation failed%s",
 			real_size, (nofail) ? ". Retrying." : "");
+
 		if (nofail) {
 			schedule_timeout_uninterruptible(1);
+			// 睡眠一个 tick，避免忙等，把 CPU 让出去
 			goto again;
+			// 继续重新申请 vmalloc 区域
 		}
+
 		goto fail;
+		// 非 nofail 情况则进入失败处理
 	}
 
 	/*
@@ -3823,12 +3860,17 @@ again:
 	 * kasan_unpoison_vmalloc().
 	 */
 	if (pgprot_val(prot) == pgprot_val(PAGE_KERNEL)) {
+		// 如果这是普通内核页权限的映射（最常见 vmalloc 场景）
+
 		if (kasan_hw_tags_enabled()) {
 			/*
 			 * Modify protection bits to allow tagging.
 			 * This must be done before mapping.
 			 */
 			prot = arch_vmap_pgprot_tagged(prot);
+			// 如果开启了硬件 tag KASAN，那么需要先调整页保护属性，
+			// 使映射支持 memory tagging
+			// 这一步必须在真正建映射之前完成
 
 			/*
 			 * Skip page_alloc poisoning and zeroing for physical
@@ -3836,16 +3878,25 @@ again:
 			 * poisoned and zeroed by kasan_unpoison_vmalloc().
 			 */
 			gfp_mask |= __GFP_SKIP_KASAN | __GFP_SKIP_ZERO;
+			// 底层分配物理页时，跳过 page allocator 默认的 KASAN poison 和清零
+			// 因为 vmalloc 映射建立完之后，会由 kasan_unpoison_vmalloc() 统一处理
 		}
 
 		/* Take note that the mapping is PAGE_KERNEL. */
 		kasan_flags |= KASAN_VMALLOC_PROT_NORMAL;
+		// 记录：这是普通 PAGE_KERNEL 映射，供后续 KASAN 逻辑使用
 	}
 
 	/* Allocate physical pages and map them into vmalloc space. */
 	ret = __vmalloc_area_node(area, gfp_mask, prot, shift, node);
+	// 这是 vmalloc 的核心步骤：
+	// 1. 为 area 这段虚拟地址空间分配底层物理页
+	// 2. 将这些物理页逐页（或按更大粒度）映射到 area 对应的虚拟地址范围
+	// 3. 最终形成“虚拟连续、物理可不连续”的内核映射
+
 	if (!ret)
 		goto fail;
+	// 如果物理页分配或页表映射失败，则进入失败处理
 
 	/*
 	 * Mark the pages as accessible, now that they are mapped.
@@ -3856,11 +3907,24 @@ again:
 	 * allocations, see __kasan_unpoison_vmalloc().
 	 */
 	kasan_flags |= KASAN_VMALLOC_VM_ALLOC;
+	// 标记：这是 VM_ALLOC 类型的 vmalloc 区域
+
 	if (!want_init_on_free() && want_init_on_alloc(gfp_mask) &&
 	    (gfp_mask & __GFP_SKIP_ZERO))
 		kasan_flags |= KASAN_VMALLOC_INIT;
+	// 如果系统策略要求“分配时初始化”，并且之前又跳过了 page allocator 的清零，
+	// 那么这里告诉 KASAN：后续要把这块 vmalloc 内存初始化
+
 	/* KASAN_VMALLOC_PROT_NORMAL already set if required. */
 	area->addr = kasan_unpoison_vmalloc(area->addr, real_size, kasan_flags);
+	// 现在映射已经建立，可以把这片区域标记为“可访问”
+	// 同时根据 kasan_flags 做：
+	// 1. unpoison
+	// 2. 打 tag（如果是硬件 tag 模式）
+	// 3. 需要的话做初始化/清零
+	//
+	// 注意这里用的是 real_size，而不是对齐后的 size，
+	// 因为真正对用户可见的有效大小是原始申请大小
 
 	/*
 	 * In this function, newly allocated vm_struct has VM_UNINITIALIZED
@@ -3868,12 +3932,19 @@ again:
 	 * Now, it is fully initialized, so remove this flag here.
 	 */
 	clear_vm_uninitialized_flag(area);
+	// 到这里 area 已经完整可用了，把 VM_UNINITIALIZED 标志清掉
 
 	size = PAGE_ALIGN(size);
+	// 用页对齐后的大小给 kmemleak 记录
+	// 注意此处 size 可能是普通页对齐，也可能是 huge-vmap 粒度对齐后的大小
+
 	if (!(vm_flags & VM_DEFER_KMEMLEAK))
 		kmemleak_vmalloc(area, size, gfp_mask);
+	// 如果没有要求延迟 kmemleak 处理，就把这次 vmalloc 分配登记给 kmemleak
+	// 用于后续内存泄漏检测
 
 	return area->addr;
+	// 返回连续的内核虚拟地址
 
 fail:
 	if (shift > PAGE_SHIFT) {
@@ -3882,8 +3953,12 @@ fail:
 		size = real_size;
 		goto again;
 	}
+	// 如果前面失败时用的是 huge vmap（大页粒度映射），
+	// 那么退化回普通 PAGE_SHIFT 粒度再试一次
+	// 也就是：先尽量尝试大页映射，失败了就降级为普通页映射
 
 	return NULL;
+	// 普通映射也失败了，最终返回 NULL
 }
 
 /**

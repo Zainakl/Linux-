@@ -257,61 +257,59 @@ struct kmem_cache_order_objects {
  */
 struct kmem_cache {
 #ifndef CONFIG_SLUB_TINY
-	struct kmem_cache_cpu __percpu *cpu_slab;
+	struct kmem_cache_cpu __percpu *cpu_slab;   // 每CPU一个本地slab管理结构，走SLUB快速分配路径
 #endif
 	/* Used for retrieving partial slabs, etc. */
-	slab_flags_t flags;
-	unsigned long min_partial;
-	unsigned int size;		/* Object size including metadata */
-	unsigned int object_size;	/* Object size without metadata */
-	struct reciprocal_value reciprocal_size;
-	unsigned int offset;		/* Free pointer offset */
+	slab_flags_t flags;                         // slab缓存的标志位，控制调试/安全/分配行为
+	unsigned long min_partial;                 // 每个node最少保留的partial slab数量
+	unsigned int size;                         // 对象实际占用大小，包含元数据、对齐填充等
+	unsigned int object_size;                  // 对象原始大小，不包含SLUB附加元数据
+	struct reciprocal_value reciprocal_size;   // size的倒数辅助值，用乘法替代除法提高效率
+	unsigned int offset;                       // 空闲对象里freelist指针存放的偏移位置
 #ifdef CONFIG_SLUB_CPU_PARTIAL
-	/* Number of per cpu partial objects to keep around */
-	unsigned int cpu_partial;
-	/* Number of per cpu partial slabs to keep around */
-	unsigned int cpu_partial_slabs;
+	unsigned int cpu_partial;                  // 每CPU允许保留的partial对象数量上限
+	unsigned int cpu_partial_slabs;            // 每CPU允许保留的partial slab数量上限
 #endif
-	struct kmem_cache_order_objects oo;
+	struct kmem_cache_order_objects oo;        // 当前slab布局：order和objects数量的组合信息
 
 	/* Allocation and freeing of slabs */
-	struct kmem_cache_order_objects min;
-	gfp_t allocflags;		/* gfp flags to use on each alloc */
-	int refcount;			/* Refcount for slab cache destroy */
-	void (*ctor)(void *object);	/* Object constructor */
-	unsigned int inuse;		/* Offset to metadata */
-	unsigned int align;		/* Alignment */
-	unsigned int red_left_pad;	/* Left redzone padding size */
-	const char *name;		/* Name (only for display!) */
-	struct list_head list;		/* List of slab caches */
+	struct kmem_cache_order_objects min;       // 最小可接受的slab布局，内存紧张时可退化使用
+	gfp_t allocflags;                          // 给该cache分配底层页时使用的GFP标志
+	int refcount;                              // cache本身的引用计数，用于销毁判断
+	void (*ctor)(void *object);                // 对象构造函数，新对象建立时初始化用
+	unsigned int inuse;                        // 对象中实际使用区域或元数据起始偏移
+	unsigned int align;                        // 对象的对齐要求
+	unsigned int red_left_pad;                 // 左侧redzone保护区大小，用于越界检测
+	const char *name;                          // cache名字，主要用于显示和调试
+	struct list_head list;                     // 把所有kmem_cache挂到全局链表中
 #ifdef CONFIG_SYSFS
-	struct kobject kobj;		/* For sysfs */
+	struct kobject kobj;                       // sysfs对象，用于在sysfs中导出信息
 #endif
 #ifdef CONFIG_SLAB_FREELIST_HARDENED
-	unsigned long random;
+	unsigned long random;                      // freelist加固用随机数，防止freelist攻击
 #endif
 
 #ifdef CONFIG_NUMA
 	/*
 	 * Defragmentation by allocating from a remote node.
 	 */
-	unsigned int remote_node_defrag_ratio;
+	unsigned int remote_node_defrag_ratio;     // NUMA下远程节点分配比例，用于缓解本地碎片
 #endif
 
 #ifdef CONFIG_SLAB_FREELIST_RANDOM
-	unsigned int *random_seq;
+	unsigned int *random_seq;                  // freelist随机化顺序数组，提高安全性
 #endif
 
 #ifdef CONFIG_KASAN_GENERIC
-	struct kasan_cache kasan_info;
+	struct kasan_cache kasan_info;             // KASAN相关信息，用于内存越界/非法访问检测
 #endif
 
 #ifdef CONFIG_HARDENED_USERCOPY
-	unsigned int useroffset;	/* Usercopy region offset */
-	unsigned int usersize;		/* Usercopy region size */
+	unsigned int useroffset;                   // 允许usercopy区域的起始偏移
+	unsigned int usersize;                     // 允许usercopy区域的大小
 #endif
 
-	struct kmem_cache_node *node[MAX_NUMNODES];
+	struct kmem_cache_node *node[MAX_NUMNODES]; // 每个NUMA节点对应一个node管理结构
 };
 
 #if defined(CONFIG_SYSFS) && !defined(CONFIG_SLUB_TINY)

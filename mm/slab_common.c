@@ -216,38 +216,39 @@ struct kmem_cache *find_mergeable(unsigned int size, unsigned int align,
 	return NULL;
 }
 
-static struct kmem_cache *create_cache(const char *name,
-				       unsigned int object_size,
-				       struct kmem_cache_args *args,
-				       slab_flags_t flags)
+static struct kmem_cache *create_cache(const char *name,   // cache名字
+				       unsigned int object_size,   // 对象原始大小
+				       struct kmem_cache_args *args, // 创建参数，包含对齐、ctor、usercopy、freeptr等信息
+				       slab_flags_t flags)          // slab标志位
 {
-	struct kmem_cache *s;
-	int err;
+	struct kmem_cache *s;                        // 新建的kmem_cache对象
+	int err;                                     // 错误码
 
 	/* If a custom freelist pointer is requested make sure it's sane. */
-	err = -EINVAL;
-	if (args->use_freeptr_offset &&
-	    (args->freeptr_offset >= object_size ||
-	     !(flags & SLAB_TYPESAFE_BY_RCU) ||
-	     !IS_ALIGNED(args->freeptr_offset, __alignof__(freeptr_t))))
-		goto out;
+	err = -EINVAL;                               // 先默认错误码为参数非法
+	if (args->use_freeptr_offset &&              // 如果请求使用自定义freelist指针偏移
+	    (args->freeptr_offset >= object_size || // freelist偏移不能超出对象范围
+	     !(flags & SLAB_TYPESAFE_BY_RCU) ||     // 只有设置了SLAB_TYPESAFE_BY_RCU才允许自定义freeptr位置
+	     !IS_ALIGNED(args->freeptr_offset, __alignof__(freeptr_t)))) // 偏移必须按freeptr_t类型对齐
+		goto out;                                // 任一条件不满足，直接返回错误
 
-	err = -ENOMEM;
-	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
+	err = -ENOMEM;                               // 后续失败默认按内存分配失败处理
+	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL); // 从“kmem_cache这个cache”里分配一个新的kmem_cache对象，并清零
 	if (!s)
-		goto out;
-	err = do_kmem_cache_create(s, name, object_size, args, flags);
-	if (err)
-		goto out_free_cache;
+		goto out;                                // 分配失败则返回
 
-	s->refcount = 1;
-	list_add(&s->list, &slab_caches);
-	return s;
+	err = do_kmem_cache_create(s, name, object_size, args, flags); // 真正初始化这个kmem_cache的各个字段和内部结构
+	if (err)
+		goto out_free_cache;                     // 初始化失败则释放刚分配的kmem_cache对象
+
+	s->refcount = 1;                             // 新建cache初始引用计数设为1
+	list_add(&s->list, &slab_caches);            // 把新cache挂到全局slab_caches链表中
+	return s;                                    // 返回新建成功的kmem_cache
 
 out_free_cache:
-	kmem_cache_free(kmem_cache, s);
+	kmem_cache_free(kmem_cache, s);              // 初始化失败，释放前面分配的kmem_cache对象
 out:
-	return ERR_PTR(err);
+	return ERR_PTR(err);                         // 返回错误指针，里面封装了错误码
 }
 
 /**
@@ -277,14 +278,14 @@ out:
  *
  * Return: a pointer to the cache on success, NULL on failure.
  */
-struct kmem_cache *__kmem_cache_create_args(const char *name,
-					    unsigned int object_size,
-					    struct kmem_cache_args *args,
-					    slab_flags_t flags)
+struct kmem_cache *__kmem_cache_create_args(const char *name,   // slab缓存名字
+					    unsigned int object_size,   // 对象原始大小
+					    struct kmem_cache_args *args, // 额外创建参数，里面有align、ctor、usercopy等信息
+					    slab_flags_t flags)          // slab创建标志
 {
-	struct kmem_cache *s = NULL;
-	const char *cache_name;
-	int err;
+	struct kmem_cache *s = NULL;               // 最终返回的kmem_cache指针
+	const char *cache_name;                    // 复制后的cache名字
+	int err;                                   // 错误码
 
 #ifdef CONFIG_SLUB_DEBUG
 	/*
@@ -294,22 +295,22 @@ struct kmem_cache *__kmem_cache_create_args(const char *name,
 	 * It's also possible that this is the first cache created with
 	 * SLAB_STORE_USER and we should init stack_depot for it.
 	 */
-	if (flags & SLAB_DEBUG_FLAGS)
-		static_branch_enable(&slub_debug_enabled);
-	if (flags & SLAB_STORE_USER)
-		stack_depot_init();
+	if (flags & SLAB_DEBUG_FLAGS)              // 如果这次创建显式带了debug标志
+		static_branch_enable(&slub_debug_enabled); // 打开slub debug的静态分支
+	if (flags & SLAB_STORE_USER)               // 如果需要记录分配/释放调用栈
+		stack_depot_init();                    // 初始化stack depot，用来存栈信息
 #endif
 
-	mutex_lock(&slab_mutex);
+	mutex_lock(&slab_mutex);                   // 加全局锁，保护slab cache创建过程
 
-	err = kmem_cache_sanity_check(name, object_size);
+	err = kmem_cache_sanity_check(name, object_size); // 检查name和object_size是否合法
 	if (err) {
-		goto out_unlock;
+		goto out_unlock;                      // 检查失败就跳到解锁退出
 	}
 
 	/* Refuse requests with allocator specific flags */
-	if (flags & ~SLAB_FLAGS_PERMITTED) {
-		err = -EINVAL;
+	if (flags & ~SLAB_FLAGS_PERMITTED) {       // 如果传入了不允许的flag
+		err = -EINVAL;                        // 返回参数非法
 		goto out_unlock;
 	}
 
@@ -319,51 +320,51 @@ struct kmem_cache *__kmem_cache_create_args(const char *name,
 	 * case, and we'll just provide them with a sanitized version of the
 	 * passed flags.
 	 */
-	flags &= CACHE_CREATE_MASK;
+	flags &= CACHE_CREATE_MASK;                // 进一步按当前分配器允许的掩码过滤flags
 
 	/* Fail closed on bad usersize of useroffset values. */
-	if (!IS_ENABLED(CONFIG_HARDENED_USERCOPY) ||
-	    WARN_ON(!args->usersize && args->useroffset) ||
-	    WARN_ON(object_size < args->usersize ||
-		    object_size - args->usersize < args->useroffset))
-		args->usersize = args->useroffset = 0;
+	if (!IS_ENABLED(CONFIG_HARDENED_USERCOPY) ||  // 如果没启用HARDENED_USERCOPY
+	    WARN_ON(!args->usersize && args->useroffset) || // usersize为0但useroffset不为0，不合法
+	    WARN_ON(object_size < args->usersize ||         // usercopy区域大小超过对象大小
+		    object_size - args->usersize < args->useroffset)) // useroffset + usersize越过对象边界
+		args->usersize = args->useroffset = 0; // usercopy参数非法就清零，禁止这部分配置
 
-	if (!args->usersize)
+	if (!args->usersize)                       // 只有没设置usercopy区域时，才允许尝试alias复用
 		s = __kmem_cache_alias(name, object_size, args->align, flags,
-				       args->ctor);
+				       args->ctor); // 查找是否已有兼容的kmem_cache可直接复用
 	if (s)
-		goto out_unlock;
+		goto out_unlock;                      // 找到了可复用的cache，直接返回
 
-	cache_name = kstrdup_const(name, GFP_KERNEL);
+	cache_name = kstrdup_const(name, GFP_KERNEL); // 复制cache名字，供新cache长期保存
 	if (!cache_name) {
-		err = -ENOMEM;
+		err = -ENOMEM;                        // 名字分配失败
 		goto out_unlock;
 	}
 
-	args->align = calculate_alignment(flags, args->align, object_size);
-	s = create_cache(cache_name, object_size, args, flags);
-	if (IS_ERR(s)) {
-		err = PTR_ERR(s);
-		kfree_const(cache_name);
+	args->align = calculate_alignment(flags, args->align, object_size); // 重新计算实际对齐值
+	s = create_cache(cache_name, object_size, args, flags); // 真正创建新的kmem_cache
+	if (IS_ERR(s)) {                           // 如果创建失败
+		err = PTR_ERR(s);                     // 提取错误码
+		kfree_const(cache_name);              // 释放前面复制的名字
 	}
 
 out_unlock:
-	mutex_unlock(&slab_mutex);
+	mutex_unlock(&slab_mutex);                 // 退出前释放全局锁
 
-	if (err) {
-		if (flags & SLAB_PANIC)
+	if (err) {                                 // 如果前面任何一步出错
+		if (flags & SLAB_PANIC)               // 如果设置了SLAB_PANIC
 			panic("%s: Failed to create slab '%s'. Error %d\n",
-				__func__, name, err);
+				__func__, name, err);       // 直接panic
 		else {
 			pr_warn("%s(%s) failed with error %d\n",
-				__func__, name, err);
-			dump_stack();
+				__func__, name, err);       // 打印警告信息
+			dump_stack();                   // 打印调用栈，方便调试
 		}
-		return NULL;
+		return NULL;                          // 创建失败返回NULL
 	}
-	return s;
+	return s;                                  // 返回复用到的或新建的kmem_cache
 }
-EXPORT_SYMBOL(__kmem_cache_create_args);
+EXPORT_SYMBOL(__kmem_cache_create_args);      // 导出符号，供其他内核模块使用
 
 static struct kmem_cache *kmem_buckets_cache __ro_after_init;
 
