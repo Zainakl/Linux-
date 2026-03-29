@@ -2440,52 +2440,59 @@ static unsigned long __mmap_region(struct file *file, unsigned long addr,
 		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
 		struct list_head *uf)
 {
-	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma = NULL;
-	int error;
-	VMA_ITERATOR(vmi, mm, addr);
-	MMAP_STATE(map, mm, &vmi, addr, len, pgoff, vm_flags, file);
+	struct mm_struct *mm = current->mm;      // 取当前进程的地址空间描述符 mm，后续所有 VMA 操作都挂在这个 mm 上
+	struct vm_area_struct *vma = NULL;       // 先定义一个 VMA 指针，后面可能是“新建的”，也可能是“合并后的”
+	int error;                               // 保存错误码
+	VMA_ITERATOR(vmi, mm, addr);             // 定义 VMA 迭代器，从 addr 附近开始查找/遍历 VMA
+	MMAP_STATE(map, mm, &vmi, addr, len, pgoff, vm_flags, file); // 构造 mmap 过程的上下文状态 map
+	                                                              // 里面会记录 mm、地址、长度、文件、flag、前后相邻 VMA 等信息
 
-	error = __mmap_prepare(&map, uf);
-	if (error)
-		goto abort_munmap;
+	error = __mmap_prepare(&map, uf);        // 做正式映射前的准备工作
+	                                         // 一般包括：检查地址区间、处理与旧 VMA 的冲突、资源记账、确定 prev/next 等
+	if (error)                               // 如果准备阶段失败
+		goto abort_munmap;                    // 跳到失败清理路径，撤销前面可能做的一些拆分/摘链动作
 
 	/* Attempt to merge with adjacent VMAs... */
-	if (map.prev || map.next) {
-		VMG_MMAP_STATE(vmg, &map, /* vma = */ NULL);
+	if (map.prev || map.next) {              // 如果新映射区域前后存在相邻 VMA，就尝试合并，避免 VMA 过碎
+		VMG_MMAP_STATE(vmg, &map, /* vma = */ NULL); // 构造 merge 用的状态对象 vmg，此时还没有新 VMA
 
-		vma = vma_merge_new_range(&vmg);
+		vma = vma_merge_new_range(&vmg);     // 尝试把“即将建立的新映射区间”和前后相邻 VMA 合并
+		                                     // 如果合并成功，返回合并后的 VMA；失败则返回 NULL
 	}
 
 	/* ...but if we can't, allocate a new VMA. */
-	if (!vma) {
-		error = __mmap_new_vma(&map, &vma);
-		if (error)
-			goto unacct_error;
+	if (!vma) {                              // 如果上一步不能合并，那就只能新建一个 VMA
+		error = __mmap_new_vma(&map, &vma);  // 分配并初始化新的 vm_area_struct
+		                                     // 把 addr/len/pgoff/file/vm_flags 等信息填进去
+		if (error)                           // 新建 VMA 失败
+			goto unacct_error;               // 走失败路径，撤销之前做过的内存记账
 	}
 
 	/* If flags changed, we might be able to merge, so try again. */
-	if (map.retry_merge) {
-		struct vm_area_struct *merged;
-		VMG_MMAP_STATE(vmg, &map, vma);
+	if (map.retry_merge) {                   // 有些情况下，新建 VMA 后 flag 可能被调整过
+		                                     // 这时原本不能合并的 VMA，后来可能又能合并了，所以再试一次
+		struct vm_area_struct *merged;       // 保存再次合并后的 VMA
+		VMG_MMAP_STATE(vmg, &map, vma);      // 构造 merge 状态，这次传入当前已经创建好的 vma
 
-		vma_iter_config(map.vmi, map.addr, map.end);
-		merged = vma_merge_existing_range(&vmg);
-		if (merged)
-			vma = merged;
+		vma_iter_config(map.vmi, map.addr, map.end); // 重新配置 VMA 迭代器，让它指向当前映射区间
+		merged = vma_merge_existing_range(&vmg);     // 尝试把“已存在的新 VMA”和相邻 VMA 再做一次合并
+		if (merged)                                  // 如果再次合并成功
+			vma = merged;                            // 用合并后的 VMA 替换当前 vma 指针
 	}
 
-	__mmap_complete(&map, vma);
+	__mmap_complete(&map, vma);              // 提交整个 mmap 操作
+	                                         // 一般会把最终 VMA 插入 mm 的 VMA 树/链表结构中，
+	                                         // 更新各种统计信息，并完成对用户态可见的映射建立
 
-	return addr;
+	return addr;                             // 成功返回映射起始地址
 
 	/* Accounting was done by __mmap_prepare(). */
 unacct_error:
-	if (map.charged)
-		vm_unacct_memory(map.charged);
+	if (map.charged)                         // 如果 __mmap_prepare() 阶段已经做过内存记账
+		vm_unacct_memory(map.charged);       // 这里要把记过的账撤销掉，避免统计不一致
 abort_munmap:
-	vms_abort_munmap_vmas(&map.vms, &map.mas_detach);
-	return error;
+	vms_abort_munmap_vmas(&map.vms, &map.mas_detach); // 撤销 prepare 阶段可能做过的 VMA 拆分/摘除等中间操作
+	return error;                            // 返回错误码
 }
 
 /**
@@ -2515,36 +2522,42 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 			  unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
 			  struct list_head *uf)
 {
-	unsigned long ret;
-	bool writable_file_mapping = false;
+	unsigned long ret;                        // 保存最终返回值：成功时一般是映射起始地址，失败时是错误码
+	bool writable_file_mapping = false;      // 标记当前是否对 file->f_mapping 做过“可写映射”登记
 
-	mmap_assert_write_locked(current->mm);
+	mmap_assert_write_locked(current->mm);   // 断言：当前进程的 mm 的 mmap 写锁已经持有
+	                                        // mmap_region 会修改进程地址空间，所以必须持写锁
 
 	/* Check to see if MDWE is applicable. */
-	if (map_deny_write_exec(vm_flags, vm_flags))
-		return -EACCES;
+	if (map_deny_write_exec(vm_flags, vm_flags))   // 检查是否触发 MDWE（Memory-Deny-Write-Execute）策略
+		return -EACCES;                             // 如果当前映射同时违反“可写+可执行”等安全策略，拒绝映射
 
 	/* Allow architectures to sanity-check the vm_flags. */
-	if (!arch_validate_flags(vm_flags))
-		return -EINVAL;
+	if (!arch_validate_flags(vm_flags))      // 让具体架构检查 vm_flags 是否合法
+		return -EINVAL;                      // 比如某些架构不支持某些 flag 组合，直接返回参数非法
 
 	/* Map writable and ensure this isn't a sealed memfd. */
-	if (file && is_shared_maywrite(vm_flags)) {
-		int error = mapping_map_writable(file->f_mapping);
-
+	if (file && is_shared_maywrite(vm_flags)) {    // 如果是文件映射，并且这是一个“共享且可写”的映射
+		int error = mapping_map_writable(file->f_mapping); // 在 address_space 层登记“我要建立可写映射”
+		                                                  // 同时也会检查该文件是否允许这样做
 		if (error)
-			return error;
-		writable_file_mapping = true;
+			return error;                   // 如果失败，直接返回错误
+		writable_file_mapping = true;       // 记录已经成功登记，后面需要对称撤销
 	}
 
-	ret = __mmap_region(file, addr, len, vm_flags, pgoff, uf);
+	ret = __mmap_region(file, addr, len, vm_flags, pgoff, uf); // 真正执行映射的核心函数
+	                                                           // 主要工作包括：
+	                                                           // 1. 选择/检查虚拟地址区间
+	                                                           // 2. 创建并初始化 VMA
+	                                                           // 3. 建立与 file 或匿名内存的关联
+	                                                           // 4. 插入 mm 的 VMA 结构中
 
 	/* Clear our write mapping regardless of error. */
-	if (writable_file_mapping)
-		mapping_unmap_writable(file->f_mapping);
+	if (writable_file_mapping)              // 如果前面做过可写映射登记
+		mapping_unmap_writable(file->f_mapping); // 这里无论成功失败都要撤销这次临时登记，保持计数平衡
 
-	validate_mm(current->mm);
-	return ret;
+	validate_mm(current->mm);               // 调试/校验当前进程 mm 的内部结构是否一致
+	return ret;                             // 返回结果：成功返回映射地址，失败返回负错误码
 }
 
 /*
