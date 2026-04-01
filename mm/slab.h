@@ -264,7 +264,7 @@ struct kmem_cache {
 	unsigned long min_partial;                 // 每个node最少保留的partial slab数量
 	unsigned int size;                         // 对象实际占用大小，包含元数据、对齐填充等
 	unsigned int object_size;                  // 对象原始大小，不包含SLUB附加元数据
-	struct reciprocal_value reciprocal_size;   // size的倒数辅助值，用乘法替代除法提高效率
+	struct reciprocal_value reciprocal_size;   // size的倒数辅助值，用乘法替代除法提高效率	
 	unsigned int offset;                       // 空闲对象里freelist指针存放的偏移位置
 #ifdef CONFIG_SLUB_CPU_PARTIAL
 	unsigned int cpu_partial;                  // 每CPU允许保留的partial对象数量上限

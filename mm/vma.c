@@ -2488,7 +2488,7 @@ static unsigned long __mmap_region(struct file *file, unsigned long addr,
 
 	/* Accounting was done by __mmap_prepare(). */
 unacct_error:
-	if (map.charged)                         // 如果 __mmap_prepare() 阶段已经做过内存记账
+	if (map.charged)                         // 如果 __mmap_prepare() 阶段已经做过内存记账	
 		vm_unacct_memory(map.charged);       // 这里要把记过的账撤销掉，避免统计不一致
 abort_munmap:
 	vms_abort_munmap_vmas(&map.vms, &map.mas_detach); // 撤销 prepare 阶段可能做过的 VMA 拆分/摘除等中间操作

@@ -630,33 +630,98 @@ static inline void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
 #endif /* CONFIG_LRU_GEN */
 
 struct lruvec {
+	/* 
+	 * 多条 LRU 链表的链表头数组。
+	 * 下标一般对应 inactive_anon / active_anon /
+	 * inactive_file / active_file / unevictable 等不同类型的 LRU。
+	 * 也就是说，一个 lruvec 不是一条链表，而是一组 LRU 链表。
+	 */
 	struct list_head		lists[NR_LRU_LISTS];
-	/* per lruvec lru_lock for memcg */
+
+	/* 
+	 * 保护当前 lruvec 的自旋锁。
+	 * 主要用于保护 LRU 链表本身以及相关统计状态，
+	 * 防止 reclaim、compaction、页访问路径并发修改链表。
+	 */
 	spinlock_t			lru_lock;
+
 	/*
-	 * These track the cost of reclaiming one LRU - file or anon -
-	 * over the other. As the observed cost of reclaiming one LRU
-	 * increases, the reclaim scan balance tips toward the other.
+	 * 这两个字段用于记录 anon/file 两类页的“回收成本”。
+	 * reclaim 时不会永远平均扫描 anon 和 file，
+	 * 而是会根据实际观察到的回收代价动态调整扫描比例：
+	 *
+	 * - anon_cost 大：说明匿名页回收代价更高
+	 * - file_cost 大：说明文件页回收代价更高
+	 *
+	 * 内核会根据这个成本平衡扫描方向，
+	 * 某一类越难回收，就可能更多去扫描另一类。
 	 */
 	unsigned long			anon_cost;
 	unsigned long			file_cost;
-	/* Non-resident age, driven by LRU movement */
+
+	/* 
+	 * 非驻留页年龄计数器。
+	 * 用于记录“不在内存中的页”的时间推进，
+	 * 常配合 refault 判断一个页被回收后是否又很快被访问回来。
+	 *
+	 * 可以把它理解成一个“时间轴”或“年龄戳”。
+	 */
 	atomic_long_t			nonresident_age;
-	/* Refaults at the time of last reclaim cycle */
+
+	/* 
+	 * 上一次 reclaim 周期时的 refault 统计信息。
+	 * refault 指页面被回收后，又因为访问重新 fault 回来。
+	 *
+	 * 这里分别统计：
+	 * - 匿名页 refault 次数
+	 * - 文件页 refault 次数
+	 *
+	 * 它可以帮助内核判断：
+	 * “我是不是把其实还很热的页错误回收掉了？”
+	 */
 	unsigned long			refaults[ANON_AND_FILE];
-	/* Various lruvec state flags (enum lruvec_flags) */
+
+	/* 
+	 * lruvec 的状态标志位。
+	 * 具体含义由 enum lruvec_flags 定义，
+	 * 用于表示当前 lruvec 的一些运行状态。
+	 */
 	unsigned long			flags;
+
 #ifdef CONFIG_LRU_GEN
-	/* evictable pages divided into generations */
+	/* 
+	 * 多代 LRU（Multi-Gen LRU）的核心数据结构。
+	 * 如果启用了 LRU_GEN，那么页不再只是简单分 active/inactive，
+	 * 而是会按“代”来划分冷热，回收时更精细。
+	 */
 	struct lru_gen_folio		lrugen;
+
 #ifdef CONFIG_LRU_GEN_WALKS_MMU
-	/* to concurrently iterate lru_gen_mm_list */
+	/* 
+	 * 多代 LRU 在遍历 mm / 页表时用到的状态信息。
+	 * 用于支持并发遍历 lru_gen_mm_list 等结构，
+	 * 帮助通过页表访问情况更准确判断页面冷热。
+	 */
 	struct lru_gen_mm_state		mm_state;
 #endif
 #endif /* CONFIG_LRU_GEN */
+
 #ifdef CONFIG_MEMCG
+	/* 
+	 * 指向所属 NUMA 节点的 pgdat（pglist_data）。
+	 * 说明这个 lruvec 不是抽象全局唯一的一套 LRU，
+	 * 而通常是某个 memcg 在某个 node 上对应的 LRU 视图。
+	 */
 	struct pglist_data *pgdat;
 #endif
+
+	/* 
+	 * 与 zswap 相关的 lruvec 状态。
+	 * zswap 是压缩交换缓存层，匿名页在真正写入 swap 设备前，
+	 * 可以先压缩放到内存里的 zswap 池中。
+	 *
+	 * 这里维护的是当前 lruvec 在 zswap 维度下的一些状态/统计信息。
+	 */
 	struct zswap_lruvec_state zswap_lruvec_state;
 };
 
