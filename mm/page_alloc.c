@@ -3913,64 +3913,65 @@ static unsigned int check_retry_zonelist(unsigned int seq)
 }
 
 /* Perform direct synchronous page reclaim */
-static unsigned long
-__perform_reclaim(gfp_t gfp_mask, unsigned int order,
-					const struct alloc_context *ac)
+/* Perform direct synchronous page reclaim */                         // 执行一次直接同步页回收
+static unsigned long                                                  // 返回本次回收取得的进展量
+__perform_reclaim(gfp_t gfp_mask, unsigned int order,                 // gfp_mask：分配/回收掩码；order：申请页的阶数
+					const struct alloc_context *ac)                    // ac：分配上下文，里面带 zonelist、nodemask 等信息
 {
-	unsigned int noreclaim_flag;
-	unsigned long progress;
+	unsigned int noreclaim_flag;                                       // 保存当前线程原有的 noreclaim 状态，回头要恢复
+	unsigned long progress;                                            // 记录本次 direct reclaim 的回收进展
 
-	cond_resched();
+	cond_resched();                                                    // 如果当前内核执行时间较长且允许调度，就先主动让出 CPU 一次
 
-	/* We now go into synchronous reclaim */
-	cpuset_memory_pressure_bump();
-	fs_reclaim_acquire(gfp_mask);
-	noreclaim_flag = memalloc_noreclaim_save();
+	/* We now go into synchronous reclaim */                           // 从这里开始正式进入同步回收流程
+	cpuset_memory_pressure_bump();                                     // 给 cpuset 记一次内存压力事件，表示当前任务已因内存紧张进入 reclaim
+	fs_reclaim_acquire(gfp_mask);                                      // 标记当前线程进入 FS reclaim 上下文，避免文件系统相关路径出现不安全递归
+	noreclaim_flag = memalloc_noreclaim_save();                        // 保存并设置 noreclaim 状态，防止 reclaim 过程中再次递归触发 reclaim
 
-	progress = try_to_free_pages(ac->zonelist, order, gfp_mask,
-								ac->nodemask);
+	progress = try_to_free_pages(ac->zonelist, order, gfp_mask,        // 真正进入页回收主线：按 zonelist、order、gfp_mask 去尝试释放页面
+								ac->nodemask);                         // nodemask：限制可回收/扫描的 NUMA 节点范围
 
-	memalloc_noreclaim_restore(noreclaim_flag);
-	fs_reclaim_release(gfp_mask);
+	memalloc_noreclaim_restore(noreclaim_flag);                        // 恢复进入本函数前的 noreclaim 状态
+	fs_reclaim_release(gfp_mask);                                      // 退出 FS reclaim 上下文，清除“当前线程正在 reclaim”的标记
 
-	cond_resched();
+	cond_resched();                                                    // 回收结束后再给一次调度点，避免当前线程长时间占用 CPU
 
-	return progress;
+	return progress;                                                   // 返回本次 direct reclaim 的进展情况给上层
 }
 
 /* The really slow allocator path where we enter direct reclaim */
-static inline struct page *
-__alloc_pages_direct_reclaim(gfp_t gfp_mask, unsigned int order,
-		unsigned int alloc_flags, const struct alloc_context *ac,
-		unsigned long *did_some_progress)
+static inline struct page *                                            // 直接回收（direct reclaim）后再尝试分配页面的辅助函数
+__alloc_pages_direct_reclaim(gfp_t gfp_mask, unsigned int order,       // gfp_mask：分配掩码；order：申请的页阶数
+		unsigned int alloc_flags, const struct alloc_context *ac,      // alloc_flags：分配标志；ac：分配上下文
+		unsigned long *did_some_progress)                              // 输出参数：记录 direct reclaim 是否取得了回收进展
 {
-	struct page *page = NULL;
-	unsigned long pflags;
-	bool drained = false;
+	struct page *page = NULL;                                           // 最终返回的页，先置空，表示默认分配失败
+	unsigned long pflags;                                               // 保存 PSI memstall 状态相关标志
+	bool drained = false;                                               // 标记是否已经做过一次 pcp drain，避免重复 drain
 
-	psi_memstall_enter(&pflags);
-	*did_some_progress = __perform_reclaim(gfp_mask, order, ac);
-	if (unlikely(!(*did_some_progress)))
-		goto out;
+	psi_memstall_enter(&pflags);                                        // 进入内存压力统计区，告诉 PSI：当前线程因内存紧张进入阻塞/回收路径
+	*did_some_progress = __perform_reclaim(gfp_mask, order, ac);        // 执行 direct reclaim，尝试回收内存，并记录是否有进展
+	if (unlikely(!(*did_some_progress)))                                // 如果一次 direct reclaim 完全没有回收到任何可用成果
+		goto out;                                                       // 直接退出，不再继续尝试分配
 
-retry:
-	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
+retry:                                                                  // 回收后重新尝试分配的入口
+	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);    // 从伙伴系统/zonelist 的 freelist 中重新尝试拿页
 
 	/*
-	 * If an allocation failed after direct reclaim, it could be because
-	 * pages are pinned on the per-cpu lists or in high alloc reserves.
-	 * Shrink them and try again
+	 * If an allocation failed after direct reclaim, it could be because   // 如果 direct reclaim 之后还是分配失败
+	 * pages are pinned on the per-cpu lists or in high alloc reserves.    // 可能不是“真的没页”，而是页还压在 PCP 链表或高阶保留区里
+	 * Shrink them and try again                                           // 这时就把这些页收拢回来，再重试一次
 	 */
-	if (!page && !drained) {
-		unreserve_highatomic_pageblock(ac, false);
-		drain_all_pages(NULL);
-		drained = true;
-		goto retry;
+	if (!page && !drained) {                                             // 如果这次还是没分配到，并且还没有做过 drain
+		unreserve_highatomic_pageblock(ac, false);                       // 释放/撤销部分 highatomic pageblock 预留，扩大可分配范围
+		drain_all_pages(NULL);                                            // 把各 CPU 的 per-cpu page list（PCP）中的页回收到 buddy 中
+		drained = true;                                                   // 标记已经 drain 过，防止无限重复
+		goto retry;                                                      // 再次回到 retry，重新尝试分配
 	}
 out:
-	psi_memstall_leave(&pflags);
+	psi_memstall_leave(&pflags);                                         // 离开内存压力统计区，结束 PSI memstall 统计
 
-	return page;
+	return page;                                                         // 返回分配到的页；若仍失败则返回 NULL
 }
 
 static void wake_all_kswapds(unsigned int order, gfp_t gfp_mask,

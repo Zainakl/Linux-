@@ -6278,66 +6278,67 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  * returns:	0, if no pages reclaimed
  * 		else, the number of pages reclaimed
  */
-static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
-					  struct scan_control *sc)
+static unsigned long do_try_to_free_pages(struct zonelist *zonelist,          // direct reclaim 真正扫描回收页的主函数
+					  struct scan_control *sc)                  // scan_control 保存回收策略、限制条件和统计信息
 {
-	int initial_priority = sc->priority;
-	pg_data_t *last_pgdat;
-	struct zoneref *z;
-	struct zone *zone;
-retry:
-	delayacct_freepages_start();
+	int initial_priority = sc->priority;                                     // 保存初始优先级，用于 retry 时恢复
+	pg_data_t *last_pgdat;                                                    // 保存上一个 pgdat，用于去重
+	struct zoneref *z;                                                        // zoneref 遍历 zonelist
+	struct zone *zone;                                                        // zone 指针
 
-	if (!cgroup_reclaim(sc))
-		__count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);
+retry:                                                                      // retry 标签，用于在部分条件下重试 reclaim
+	delayacct_freepages_start();                                             // 延迟账户计数开始，统计 reclaim 页数
+
+	if (!cgroup_reclaim(sc))                                                 // 如果不是 cgroup reclaim
+		__count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);             // 给该 zone index 计一个 ALLOCSTALL 事件
 
 	do {
-		if (!sc->proactive)
-			vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
+		if (!sc->proactive)                                                  // 如果不是主动 reclaim
+			vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,           // 向内核 vmpressure 系统打点，记录当前优先级和 cgroup 压力
 					sc->priority);
-		sc->nr_scanned = 0;
-		shrink_zones(zonelist, sc);
+		sc->nr_scanned = 0;                                                 // 本次扫描页数清零
+		shrink_zones(zonelist, sc);                                         // 核心：遍历 zonelist，扫描 LRU 并回收页
 
-		if (sc->nr_reclaimed >= sc->nr_to_reclaim)
+		if (sc->nr_reclaimed >= sc->nr_to_reclaim)                          // 回收目标已达，退出循环
 			break;
 
-		if (sc->compaction_ready)
+		if (sc->compaction_ready)                                            // compaction 已准备好，退出循环
 			break;
 
 		/*
 		 * If we're getting trouble reclaiming, start doing
 		 * writepage even in laptop mode.
 		 */
-		if (sc->priority < DEF_PRIORITY - 2)
+		if (sc->priority < DEF_PRIORITY - 2)                                 // 如果多次回收进展不大，强制允许写脏页
 			sc->may_writepage = 1;
-	} while (--sc->priority >= 0);
+	} while (--sc->priority >= 0);                                           // 降低优先级再次尝试
 
 	last_pgdat = NULL;
-	for_each_zone_zonelist_nodemask(zone, z, zonelist, sc->reclaim_idx,
+	for_each_zone_zonelist_nodemask(zone, z, zonelist, sc->reclaim_idx,   // 遍历 zonelist，每个 zone
 					sc->nodemask) {
-		if (zone->zone_pgdat == last_pgdat)
+		if (zone->zone_pgdat == last_pgdat)                                  // 同一个 pgdat 跳过
 			continue;
 		last_pgdat = zone->zone_pgdat;
 
-		snapshot_refaults(sc->target_mem_cgroup, zone->zone_pgdat);
+		snapshot_refaults(sc->target_mem_cgroup, zone->zone_pgdat);         // 对每个 pgdat 做 refault snapshot
 
-		if (cgroup_reclaim(sc)) {
+		if (cgroup_reclaim(sc)) {                                           // 如果是 cgroup reclaim
 			struct lruvec *lruvec;
 
-			lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup,
+			lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup,              // 获取该 cgroup 在 zone 的 lruvec
 						   zone->zone_pgdat);
-			clear_bit(LRUVEC_CGROUP_CONGESTED, &lruvec->flags);
+			clear_bit(LRUVEC_CGROUP_CONGESTED, &lruvec->flags);            // 清除 congested 标记
 		}
 	}
 
-	delayacct_freepages_end();
+	delayacct_freepages_end();                                              // 延迟账户计数结束
 
-	if (sc->nr_reclaimed)
-		return sc->nr_reclaimed;
+	if (sc->nr_reclaimed)                                                   // 如果已经回收了页
+		return sc->nr_reclaimed;                                           // 返回回收页数
 
 	/* Aborted reclaim to try compaction? don't OOM, then */
-	if (sc->compaction_ready)
-		return 1;
+	if (sc->compaction_ready)                                               // 如果中途为 compaction 暂停回收
+		return 1;                                                           // 返回 1 避免触发 OOM
 
 	/*
 	 * In most cases, direct reclaimers can do partial walks
@@ -6348,10 +6349,10 @@ retry:
 	 * individual threads not seeing enough cgroups to make
 	 * meaningful forward progress. Avoid false OOMs in this case.
 	 */
-	if (!sc->memcg_full_walk) {
-		sc->priority = initial_priority;
-		sc->memcg_full_walk = 1;
-		goto retry;
+	if (!sc->memcg_full_walk) {                                            // 如果没有做完整 cgroup 遍历
+		sc->priority = initial_priority;                                    // 恢复初始优先级
+		sc->memcg_full_walk = 1;                                            // 标记下次强制做完整 cgroup 遍历
+		goto retry;                                                         // 重试 reclaim
 	}
 
 	/*
@@ -6363,23 +6364,23 @@ retry:
 	 * entire cgroup subtree up front, we assume the estimates are
 	 * good, and retry with forcible deactivation if that fails.
 	 */
-	if (sc->skipped_deactivate) {
-		sc->priority = initial_priority;
-		sc->force_deactivate = 1;
-		sc->skipped_deactivate = 0;
-		goto retry;
+	if (sc->skipped_deactivate) {                                          // 如果之前跳过了 deactivate
+		sc->priority = initial_priority;                                    // 恢复初始优先级
+		sc->force_deactivate = 1;                                           // 强制进行 deactivate
+		sc->skipped_deactivate = 0;                                         // 清除标记
+		goto retry;                                                         // 重试 reclaim
 	}
 
 	/* Untapped cgroup reserves?  Don't OOM, retry. */
-	if (sc->memcg_low_skipped) {
-		sc->priority = initial_priority;
-		sc->force_deactivate = 0;
-		sc->memcg_low_reclaim = 1;
-		sc->memcg_low_skipped = 0;
-		goto retry;
+	if (sc->memcg_low_skipped) {                                           // 如果存在低水位 cgroup 页未扫描
+		sc->priority = initial_priority;                                    // 恢复初始优先级
+		sc->force_deactivate = 0;                                           // 不强制 deactivate
+		sc->memcg_low_reclaim = 1;                                          // 标记低水位 cgroup reclaim
+		sc->memcg_low_skipped = 0;                                          // 清除标记
+		goto retry;                                                         // 重试 reclaim
 	}
 
-	return 0;
+	return 0;                                                              // 回收失败，未释放任何页
 }
 
 static bool allow_direct_reclaim(pg_data_t *pgdat)
@@ -6511,47 +6512,47 @@ out:
 	return false;
 }
 
-unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
-				gfp_t gfp_mask, nodemask_t *nodemask)
+unsigned long try_to_free_pages(struct zonelist *zonelist, int order,      // 真正执行 direct reclaim 的入口函数，按 zonelist 和 order 尝试释放页
+				gfp_t gfp_mask, nodemask_t *nodemask)                // gfp_mask：分配掩码；nodemask：限制 NUMA 节点
 {
-	unsigned long nr_reclaimed;
-	struct scan_control sc = {
-		.nr_to_reclaim = SWAP_CLUSTER_MAX,
-		.gfp_mask = current_gfp_context(gfp_mask),
-		.reclaim_idx = gfp_zone(gfp_mask),
-		.order = order,
-		.nodemask = nodemask,
-		.priority = DEF_PRIORITY,
-		.may_writepage = !laptop_mode,
-		.may_unmap = 1,
-		.may_swap = 1,
+	unsigned long nr_reclaimed;                                           // 保存本次回收的页数（或回收进展）
+	struct scan_control sc = {                                             // 初始化扫描控制结构 scan_control
+		.nr_to_reclaim = SWAP_CLUSTER_MAX,                                 // 每次扫描目标回收页数上限
+		.gfp_mask = current_gfp_context(gfp_mask),                         // 当前线程可用的 gfp_mask，上层可能经过 context 修正
+		.reclaim_idx = gfp_zone(gfp_mask),                                 // 回收起始 zone（zone index）
+		.order = order,                                                     // 回收页的阶数
+		.nodemask = nodemask,                                               // NUMA 节点掩码
+		.priority = DEF_PRIORITY,                                           // reclaim 优先级
+		.may_writepage = !laptop_mode,                                      // 是否可以写回脏页（受笔记本模式影响）
+		.may_unmap = 1,                                                     // 是否可以解除映射（unmap）页面
+		.may_swap = 1,                                                      // 是否可以 swap 出匿名页
 	};
 
 	/*
 	 * scan_control uses s8 fields for order, priority, and reclaim_idx.
 	 * Confirm they are large enough for max values.
 	 */
-	BUILD_BUG_ON(MAX_PAGE_ORDER >= S8_MAX);
-	BUILD_BUG_ON(DEF_PRIORITY > S8_MAX);
-	BUILD_BUG_ON(MAX_NR_ZONES > S8_MAX);
+	BUILD_BUG_ON(MAX_PAGE_ORDER >= S8_MAX);                               // 编译期检查 page order 是否超过 s8 最大值
+	BUILD_BUG_ON(DEF_PRIORITY > S8_MAX);                                   // 编译期检查 priority 是否超过 s8 最大值
+	BUILD_BUG_ON(MAX_NR_ZONES > S8_MAX);                                   // 编译期检查 zone 数量是否超过 s8 最大值
 
 	/*
 	 * Do not enter reclaim if fatal signal was delivered while throttled.
 	 * 1 is returned so that the page allocator does not OOM kill at this
 	 * point.
 	 */
-	if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))
-		return 1;
+	if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))         // 如果有 fatal signal 或 throttle 条件，不进入 reclaim
+		return 1;                                                          // 返回 1，告诉上层“没发生实际回收”，避免触发 OOM kill
 
-	set_task_reclaim_state(current, &sc.reclaim_state);
-	trace_mm_vmscan_direct_reclaim_begin(order, sc.gfp_mask);
+	set_task_reclaim_state(current, &sc.reclaim_state);                    // 设置当前线程的 reclaim 状态，用于内核调试/统计/追踪
+	trace_mm_vmscan_direct_reclaim_begin(order, sc.gfp_mask);              // tracepoint，标记 direct reclaim 开始
 
-	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
+	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);                    // 真正扫描 LRU 回收页的核心函数
 
-	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);
-	set_task_reclaim_state(current, NULL);
+	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);                      // tracepoint，标记 direct reclaim 结束
+	set_task_reclaim_state(current, NULL);                                  // 清理当前线程的 reclaim 状态
 
-	return nr_reclaimed;
+	return nr_reclaimed;                                                    // 返回本次 reclaim 成功回收的页数
 }
 
 #ifdef CONFIG_MEMCG
