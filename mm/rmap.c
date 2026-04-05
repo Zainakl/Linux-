@@ -183,53 +183,53 @@ static void anon_vma_chain_link(struct vm_area_struct *vma,
  * to do any locking for the common case of already having
  * an anon_vma.
  */
-int __anon_vma_prepare(struct vm_area_struct *vma)
+int __anon_vma_prepare(struct vm_area_struct *vma)   // 为一个 VMA 准备 anon_vma 结构，建立匿名页反向映射所需关系
 {
-	struct mm_struct *mm = vma->vm_mm;
-	struct anon_vma *anon_vma, *allocated;
-	struct anon_vma_chain *avc;
+	struct mm_struct *mm = vma->vm_mm;           // 取出该 VMA 所属进程的 mm_struct（整个进程地址空间）
+	struct anon_vma *anon_vma, *allocated;       // anon_vma: 最终要挂到 vma 上的对象；allocated: 记录本次是否新分配了 anon_vma
+	struct anon_vma_chain *avc;                  // anon_vma_chain：用来把 vma 和 anon_vma 串起来的链表节点
 
-	mmap_assert_locked(mm);
-	might_sleep();
+	mmap_assert_locked(mm);                      // 断言当前线程已经持有 mm 的 mmap 锁，否则这里操作 VMA 不安全
+	might_sleep();                               // 提示这里的执行路径可能会睡眠，说明不能在原子上下文调用
 
-	avc = anon_vma_chain_alloc(GFP_KERNEL);
-	if (!avc)
-		goto out_enomem;
+	avc = anon_vma_chain_alloc(GFP_KERNEL);      // 先分配一个 anon_vma_chain 节点，后面建立 vma 和 anon_vma 的关联要用
+	if (!avc)                                    // 如果分配失败
+		goto out_enomem;                         // 直接跳到内存不足的错误处理
 
-	anon_vma = find_mergeable_anon_vma(vma);
-	allocated = NULL;
-	if (!anon_vma) {
-		anon_vma = anon_vma_alloc();
-		if (unlikely(!anon_vma))
-			goto out_enomem_free_avc;
-		anon_vma->num_children++; /* self-parent link for new root */
-		allocated = anon_vma;
+	anon_vma = find_mergeable_anon_vma(vma);     // 尝试查找一个可复用/可合并的 anon_vma，避免重复新建
+	allocated = NULL;                            // 先置空，表示当前还没有新分配 anon_vma
+	if (!anon_vma) {                             // 如果没有找到可复用的 anon_vma
+		anon_vma = anon_vma_alloc();            // 那就新建一个 anon_vma
+		if (unlikely(!anon_vma))                // 如果新建失败
+			goto out_enomem_free_avc;           // 释放前面申请的 avc 后返回 -ENOMEM
+		anon_vma->num_children++;               // 新根节点要给自己建立一个“自父子关系”，因此 children 数加 1
+		allocated = anon_vma;                   // 记录这是本次新分配的 anon_vma，后面若没挂上要回收
 	}
 
-	anon_vma_lock_write(anon_vma);
-	/* page_table_lock to protect against threads */
-	spin_lock(&mm->page_table_lock);
-	if (likely(!vma->anon_vma)) {
-		vma->anon_vma = anon_vma;
-		anon_vma_chain_link(vma, avc, anon_vma);
-		anon_vma->num_active_vmas++;
-		allocated = NULL;
-		avc = NULL;
+	anon_vma_lock_write(anon_vma);               // 对 anon_vma 加写锁，保护 anon_vma 的树和链表结构
+	/* page_table_lock to protect against threads */ // 注释：再配合 page_table_lock，防止多线程并发竞争
+	spin_lock(&mm->page_table_lock);             // 加 mm 的页表锁，防止多个线程同时给同一个 vma 安装 anon_vma
+	if (likely(!vma->anon_vma)) {                // 如果当前 vma 还没有绑定 anon_vma（常见情况）
+		vma->anon_vma = anon_vma;               // 把找到的或新分配的 anon_vma 挂到 vma 上
+		anon_vma_chain_link(vma, avc, anon_vma);// 用 avc 把 vma 和 anon_vma 正式双向链接起来
+		anon_vma->num_active_vmas++;            // 该 anon_vma 正在服务的活动 vma 数量加 1
+		allocated = NULL;                       // 既然已经成功挂到 vma，上面新分配的 anon_vma 不需要单独释放了
+		avc = NULL;                             // avc 也已经链入结构，不需要再单独 free
 	}
-	spin_unlock(&mm->page_table_lock);
-	anon_vma_unlock_write(anon_vma);
+	spin_unlock(&mm->page_table_lock);           // 释放页表锁
+	anon_vma_unlock_write(anon_vma);             // 释放 anon_vma 写锁
 
-	if (unlikely(allocated))
-		put_anon_vma(allocated);
-	if (unlikely(avc))
-		anon_vma_chain_free(avc);
+	if (unlikely(allocated))                     // 如果 allocated 还不为空，说明虽然分配了 anon_vma，但最终没挂到 vma 上
+		put_anon_vma(allocated);                // 减引用并释放这个多余的 anon_vma
+	if (unlikely(avc))                           // 如果 avc 还不为空，说明它也没有成功链入
+		anon_vma_chain_free(avc);               // 释放这个多余的 anon_vma_chain
 
-	return 0;
+	return 0;                                    // 成功返回 0
 
- out_enomem_free_avc:
-	anon_vma_chain_free(avc);
- out_enomem:
-	return -ENOMEM;
+ out_enomem_free_avc:                           // 错误路径：anon_vma 分配失败，但 avc 已经分配成功
+	anon_vma_chain_free(avc);                   // 先释放 avc
+ out_enomem:                                    // 错误路径：内存不足
+	return -ENOMEM;                             // 返回内存不足错误码
 }
 
 /*
